@@ -6,6 +6,8 @@ using TimerOutputs
 
 using Base: @lock
 
+const has_cuda_pool = Ref{Bool}()
+
 # a simple non-reentrant lock that errors when trying to reenter on the same task
 struct NonReentrantLock <: Threads.AbstractLock
   rl::ReentrantLock
@@ -145,7 +147,7 @@ const usage_limit = PerDevice{Int}() do dev
   end
 end
 
-function actual_alloc(dev::CuDevice, bytes::Integer)
+function actual_alloc(dev::CuDevice, bytes::Integer; async::Bool=false)
   buf = @device! dev begin
     # check the memory allocation limit
     if usage[dev][] + bytes > usage_limit[dev]
@@ -156,7 +158,7 @@ function actual_alloc(dev::CuDevice, bytes::Integer)
     try
       time = Base.@elapsed begin
         @timeit_debug alloc_to "alloc" begin
-          buf = Mem.alloc(Mem.Device, bytes)
+          buf = Mem.alloc(Mem.Device, bytes; async)
         end
       end
 
@@ -175,7 +177,7 @@ function actual_alloc(dev::CuDevice, bytes::Integer)
   return Block(buf, bytes; state=AVAILABLE)
 end
 
-function actual_free(dev::CuDevice, block::Block)
+function actual_free(dev::CuDevice, block::Block; async::Bool=false)
   @assert iswhole(block) "Cannot free $block: block is not whole"
   @assert block.off == 0
   @assert block.state == AVAILABLE "Cannot free $block: block is not available"
@@ -184,7 +186,7 @@ function actual_free(dev::CuDevice, block::Block)
     # free the memory
     @timeit_debug alloc_to "free" begin
       time = Base.@elapsed begin
-        Mem.free(block.buf)
+        Mem.free(block.buf; async)
       end
       block.state = INVALID
 
@@ -226,6 +228,32 @@ const pool_name = get(ENV, "JULIA_CUDA_MEMORY_POOL", "binned")
 let pool_path = joinpath(@__DIR__, "pool", "$(pool_name).jl")
   isfile(pool_path) || error("Unknown memory pool $pool_name")
   include(pool_path)
+end
+
+
+## CUDA (11.2+) stream-ordered pool allocator
+
+function cuda_pool_alloc(dev, sz)
+    block = nothing
+    for phase in 1:3
+        if phase == 2
+            @pool_timeit "$phase.0 gc (incremental)" GC.gc(false)
+        elseif phase == 3
+            @pool_timeit "$phase.0 gc (full)" GC.gc(true)
+        end
+
+        @pool_timeit "$phase.1 alloc" begin
+            block = actual_alloc(dev, sz; async=true)
+        end
+        block === nothing || break
+    end
+
+    return block
+end
+
+function cuda_pool_free(dev, block)
+    actual_free(dev, block; async=true)
+    return
 end
 
 
@@ -271,7 +299,11 @@ a [`OutOfGPUMemoryError`](@ref) if the allocation request cannot be satisfied.
   dev = device()
 
   time = Base.@elapsed begin
-    @pool_timeit "pooled alloc" block = pool_alloc(dev, sz)::Union{Nothing,Block}
+    if has_cuda_pool[]
+      @pool_timeit "CUDA-pooled alloc" block = cuda_pool_alloc(dev, sz)::Union{Nothing,Block}
+    else
+      @pool_timeit "pooled alloc" block = pool_alloc(dev, sz)::Union{Nothing,Block}
+    end
   end
   block === nothing && throw(OutOfGPUMemoryError(sz))
 
@@ -364,7 +396,11 @@ Releases a buffer pointed to by `ptr` to the memory pool.
     end
 
     time = Base.@elapsed begin
-      @pool_timeit "pooled free" pool_free(dev, block)
+      if has_cuda_pool[]
+        @pool_timeit "CUDA-pooled free" cuda_pool_free(dev, block)
+      else
+        @pool_timeit "pooled free" pool_free(dev, block)
+      end
     end
 
     alloc_stats.pool_time += time
@@ -638,4 +674,6 @@ function __init_pool__()
   if isinteractive()
     @async pool_cleanup()
   end
+
+  has_cuda_pool[] = CUDA.version() >= v"11.2"
 end
