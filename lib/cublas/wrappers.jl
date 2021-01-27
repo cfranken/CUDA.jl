@@ -1514,6 +1514,7 @@ for (fname, elty) in
     end
 end
 
+
 for (fname, elty) in
         ((:cublasDgetriBatched, :Float64),
          (:cublasSgetriBatched, :Float32),
